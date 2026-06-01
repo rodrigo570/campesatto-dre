@@ -254,6 +254,7 @@ def processar_dre_mensal(wb, nome_arquivo, ajustes, da_pct):
         'tipo': 'mensal',
         'arquivo': nome_arquivo,
         'periodo': periodo,
+        'rows_src': rows,   # linhas originais para geração do Excel completo
         'rec_bruta': rec_bruta,
         'deducoes': deducoes,
         'rec_liq_orig': rec_liq_orig,
@@ -602,102 +603,397 @@ def processar_dre_consolidada(wb, nome_arquivo, ajustes, da_pct):
 
 
 def gerar_excel_corrigido(dados_processados, ajustes, da_pct):
-    """Gera o Excel corrigido para download"""
+    """
+    Gera Excel completo com DRE linha por linha para cada arquivo processado.
+    Para DREs mensais: todas as contas do Sienge + ajustes + fórmulas encadeadas.
+    Para DREs de obras / consolidadas: painel resumido com totais.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    import io
+
     wb = Workbook()
+    first_sheet = True
 
-    P = {
-        'dark': '1A2744', 'med': '2E4A7A', 'light': 'BBDEFB',
-        'white': 'FFFFFF', 'gray': 'F5F7FA', 'gray2': 'ECEFF1',
-        'green': 'E8F5E9', '1B5E20': '1B5E20',
-        'amber': 'FFF8E1', 'E65100': 'E65100',
-        'purple': 'EDE7F6', '4A148C': '4A148C',
-    }
-
-    def fl(k): return PatternFill('solid', fgColor='FF' + P.get(k, k))
+    def fl(h):
+        h = h.lstrip('#')
+        return PatternFill('solid', fgColor='FF'+h if len(h)==6 else h)
     def ft(bold=False, sz=9, color='333333', italic=False):
-        c = color.lstrip('#')
-        if len(c) == 6: c = 'FF' + c
+        c = color.lstrip('#'); c = 'FF'+c if len(c)==6 else c
         return Font(bold=bold, size=sz, color=c, name='Arial', italic=italic)
     def al(h='left', v='center', wrap=False):
         return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
-    def bdr():
-        return Border(bottom=Side(border_style='thin', color='E2E8F0'),
-                      left=Side(border_style='thin', color='E2E8F0'))
+    def bdr(thick=False):
+        s = 'medium' if thick else 'thin'
+        return Border(bottom=Side(border_style=s, color='8AA6C4'),
+                      left=Side(border_style='thin', color='DDDDDD'))
 
-    # ABA PAINEL
-    ws = wb.active
-    ws.title = 'Painel Geral'
-    ws.column_dimensions['A'].width = 5
-    ws.column_dimensions['B'].width = 35
-    for col in ['C', 'D', 'E', 'F', 'G', 'H']:
-        ws.column_dimensions[col].width = 18
+    DARK='1A2744'; MED='2E4A7A'; LIGHT='BBDEFB'; WHITE='FFFFFF'
+    GRAY='F5F7FA'; GRAY2='ECEFF1'
+    ORIG='FFF3E0'; ORIG_FG='E65100'
+    ADJ='EDE7F6';  ADJ_FG='4A148C'
+    CORR='E8F5E9'; CORR_FG='1B5E20'
+    NOTE='FFF8E1'; NOTE_FG='856404'
 
-    ws.merge_cells('A1:H1')
-    c = ws['A1']
-    c.value = f'PAINEL DRE CORRIGIDA — CAMPESATTO CONSTRUTORA | Gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")}'
-    c.font = ft(True, 12, 'FFFFFF')
-    c.fill = fl('dark')
-    c.alignment = al('center')
-    ws.row_dimensions[1].height = 26
+    AJUSTES_CODIGOS = {
+        '01.01.02.01.06': ('irpj',  'Aj.2: IRPJ é imposto sobre o LUCRO — move para provisão no final da DRE'),
+        '01.01.02.01.05': ('csll',  'Aj.2: CSLL é imposto sobre o LUCRO — move para provisão no final da DRE'),
+        '02.01.02.05.04': ('capex', 'Aj.1: Compra de ativo (CAPEX) — vai para Ativo Imobilizado, não é despesa'),
+        '03.03.01.07':    ('amort', 'Aj.3: Amortização de principal — quitação de dívida no Balanço, não despesa'),
+    }
+    H1 = {'01','02','03','04','05'}
+    H2 = {'01.01','02.01','03.01','03.02','03.03','04.01'}
+    TOTAIS = {'01','01.01','01.01.01','01.01.02','01.01.03','01.01.03.01',
+              '02','02.01','02.01.01','02.01.02','02.01.02.05',
+              '03','03.01','03.02','03.03','03.03.01','04','04.01','05'}
 
-    headers = ['', 'OBRA / PERÍODO', 'FATURAMENTO', 'RES. ORIGINAL', '+CAPEX', '+IRPJ/CSLL', '+D&A', 'RES. CORRIGIDO']
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(4, ci, h)
-        c.font = ft(True, 9, 'FFFFFF')
-        c.fill = fl('med')
-        c.alignment = al('center')
-    ws.row_dimensions[4].height = 20
-    ws.row_dimensions[2].height = 6
-    ws.row_dimensions[3].height = 6
-
-    row = 5
+    # ── PROCESSAR CADA ARQUIVO ──
     for tipo, dados in dados_processados:
-        if tipo == 'obras':
-            for obra, d in dados.items():
-                bg = 'white' if row % 2 == 0 else 'gray'
-                for ci in range(1, 9):
-                    ws.cell(row, ci).fill = fl(bg)
-                ws.cell(row, 2, obra).font = ft(False, 9, '333333')
-                ws.cell(row, 2).alignment = al('left')
 
-                vals = [d['faturamento'], d['resultado_original'],
-                        d['aj1'], d['aj2'], d['aj4'], d['resultado_corrigido']]
-                for ci, v in zip(range(3, 9), vals):
-                    c = ws.cell(row, ci, v)
-                    c.font = ft(False, 9, '1B5E20' if (ci == 8 and v >= 0) else
-                                ('E65100' if ci in [4, 5, 6] else
-                                 ('4A148C' if ci == 7 else
-                                  ('B71C1C' if v < 0 else '333333'))))
-                    c.alignment = al('right')
-                    c.number_format = '#,##0;(#,##0);"-"'
-                row += 1
-
-        elif tipo in ('consolidada', 'mensal'):
+        # ── TIPO MENSAL: DRE LINHA POR LINHA ──
+        if tipo == 'mensal':
             d = dados
-            periodo = d.get('periodo', '')
-            label = f"{d['arquivo']}" + (f" — {periodo}" if periodo and tipo=='mensal' else '')
-            ws.cell(row, 2, label).font = ft(True, 10, '1A2744')
-            vals = [d['rec_bruta'], d['resultado_original'],
-                    d.get('capex_aj', 0), d.get('impostos_aj', 0),
-                    d.get('da_val', 0), d['resultado_corrigido']]
-            for ci, v in zip(range(3, 9), vals):
-                c = ws.cell(row, ci, v)
-                c.font = ft(True, 10, '1B5E20' if (ci == 8 and v >= 0) else '333333')
-                c.alignment = al('right')
-                c.number_format = '#,##0;(#,##0);"-"'
-            for ci in range(1, 9):
-                ws.cell(row, ci).fill = fl('light')
-            row += 1
+            periodo   = d.get('periodo', 'Mês')
+            periodo_t = periodo.replace('/', '_')
+            arquivo   = d.get('arquivo', 'DRE')
+            rows_orig = d.get('rows_src', [])     # linhas originais do arquivo
 
-    wb_bytes = io.BytesIO()
-    wb.save(wb_bytes)
-    wb_bytes.seek(0)
-    return wb_bytes.getvalue()
+            # Se não tiver rows_src (arquivo não foi repassado), usar dados resumidos
+            if not rows_orig:
+                # Fallback: aba resumida
+                tab_name = periodo_t[:28]
+                ws = wb.active if first_sheet else wb.create_sheet(tab_name)
+                first_sheet = False
+                ws.title = tab_name
+                _escrever_aba_resumida(ws, d, periodo, fl, ft, al, bdr,
+                                       DARK, MED, ORIG, ORIG_FG, ADJ, ADJ_FG,
+                                       CORR, CORR_FG, NOTE, NOTE_FG, LIGHT)
+                continue
 
+            # ── ABA DRE COMPLETA ──
+            tab_name = periodo_t[:28]
+            if first_sheet:
+                ws = wb.active; ws.title = tab_name; first_sheet = False
+            else:
+                ws = wb.create_sheet(tab_name)
 
-# ================================================================
-# INTERFACE STREAMLIT
-# ================================================================
+            ws.freeze_panes = 'C10'
+            ws.column_dimensions['A'].width = 3
+            ws.column_dimensions['B'].width = 3
+            ws.column_dimensions['C'].width = 44
+            ws.column_dimensions['D'].width = 17
+            ws.column_dimensions['E'].width = 17
+            ws.column_dimensions['F'].width = 17
+            ws.column_dimensions['G'].width = 13
+            ws.column_dimensions['H'].width = 28
+
+            # Cabeçalhos
+            for r in range(1, 6):
+                for col in range(1, 9): ws.cell(r, col).fill = fl(DARK)
+
+            ws.merge_cells('A1:H1'); c = ws['A1']
+            c.value = f'DRE CORRIGIDA — CAMPESATTO CONSTRUTORA LTDA  ·  {periodo}'
+            c.font = ft(True,14,WHITE); c.fill = fl(DARK); c.alignment = al('center')
+            ws.row_dimensions[1].height = 30
+
+            ws.merge_cells('A2:H2'); c = ws['A2']
+            c.value = "CNPJ 03.722.632/0001-57  ·  Mirassol d'Oeste – MT  ·  Fonte: Sienge ERP com 4 ajustes de conciliação"
+            c.font = ft(False,9,'AAAAAA',True); c.fill = fl(DARK); c.alignment = al('center')
+            ws.row_dimensions[2].height = 15
+
+            ws.merge_cells('A3:H3'); c = ws['A3']
+            c.value = ('🔵 AZUL = input Sienge   🟣 ROXO = ajuste (fórmula)   '
+                       '🟢 VERDE = corrigido (fórmula)   🟡 FUNDO AMARELO = linha ajustada')
+            c.font = ft(False,9,NOTE_FG,True); c.fill = fl(NOTE); c.alignment = al('left', wrap=True)
+            ws.row_dimensions[3].height = 18
+
+            ws.merge_cells('A4:H4'); c = ws['A4']
+            c.value = ('Aj.1=CAPEX fora do custo  ·  Aj.2=IRPJ/CSLL para provisão  ·  '
+                       'Aj.3=Amortização para o Balanço  ·  Aj.4=D&A estimado (% configurável abaixo)')
+            c.font = ft(False,8,'9E9E9E',True); c.fill = fl(DARK); c.alignment = al('left', wrap=True)
+            ws.row_dimensions[4].height = 16
+
+            ws.row_dimensions[5].height = 6
+            ws.merge_cells('A6:H6'); c = ws['A6']
+            c.value = '  ⚙  PARÂMETRO — altere a célula AZUL abaixo: toda a DRE recalcula automaticamente'
+            c.font = ft(True,9,WHITE); c.fill = fl(MED); c.alignment = al('left')
+            ws.row_dimensions[6].height = 16
+
+            ws.row_dimensions[7].height = 20
+            for col in range(1, 9): ws.cell(7, col).fill = fl(GRAY2)
+            ws.cell(7,3,'D&A — % da Receita Bruta mensal (Ajuste 4):').font = ft(False,10,'555555')
+            ws.cell(7,3).alignment = al('left')
+            da_cell = ws.cell(7, 4, da_pct)
+            da_cell.font = ft(True,11,'0000FF'); da_cell.fill = fl('FFFDE7')
+            da_cell.alignment = al('right'); da_cell.number_format = '0.00%'
+            DA_REF = '$D$7'
+            ws.cell(7,5,'← célula azul: altere o % e toda a DRE recalcula').font = ft(False,9,NOTE_FG,True)
+            ws.cell(7,5).alignment = al('left')
+            ws.row_dimensions[8].height = 5
+
+            # Headers colunas
+            ws.row_dimensions[9].height = 22
+            hdrs = ['','','CÓDIGO / CONTA',f'ORIGINAL ({periodo})','AJUSTE','CORRIGIDO','% Rec Bruta','NOTA DO AJUSTE']
+            hbgs = [DARK,DARK,DARK,ORIG,ADJ,CORR,CORR,DARK]
+            hfgs = [WHITE,WHITE,WHITE,ORIG_FG,ADJ_FG,CORR_FG,CORR_FG,WHITE]
+            for ci,(h,bg,fg) in enumerate(zip(hdrs,hbgs,hfgs),1):
+                c = ws.cell(9,ci,h); c.font = ft(True,9,fg); c.fill = fl(bg)
+                c.alignment = al('left' if ci<=3 else 'center'); c.border = bdr()
+            ws.row_dimensions[10].height = 4
+
+            # ── LINHAS DA DRE ──
+            cur_row = 11
+            ROW_MAP = {}
+            RB_ROW = None; RES_ROW = None
+
+            for row in rows_orig:
+                code = ' '.join(str(row[0]).strip().split()) if row[0] else ''
+                b    = str(row[1]).strip() if len(row) > 1 and row[1] else ''
+                try:
+                    raw2 = row[2] if len(row) > 2 else None
+                    if raw2 is None:
+                        val = None
+                    elif isinstance(raw2, str) and raw2.strip() in ('', periodo):
+                        val = None
+                    else:
+                        val = float(raw2)
+                except (TypeError, ValueError):
+                    val = None
+                if val is None and not b: continue
+                if b == 'Conta': continue
+
+                # Estilo por nível
+                if   code in H1:     bg,fg,bold,sz,rh = DARK,WHITE,True,11,22
+                elif code in H2:     bg,fg,bold,sz,rh = MED,WHITE,True,10,20
+                elif code in TOTAIS: bg,fg,bold,sz,rh = LIGHT,'1A2744',True,10,19
+                elif code in AJUSTES_CODIGOS:
+                                     bg,fg,bold,sz,rh = 'FFFDE7','333333',False,9,17
+                elif not code:       bg,fg,bold,sz,rh = WHITE,'AAAAAA',False,8,15
+                else:
+                    lv = code.count('.')
+                    if lv == 1:  bg,fg,bold,sz,rh = GRAY,'333333',False,9,17
+                    elif lv == 2:bg,fg,bold,sz,rh = GRAY2,'555555',False,9,16
+                    else:        bg,fg,bold,sz,rh = WHITE,'888888',False,8,15
+
+                ws.row_dimensions[cur_row].height = rh
+                for col in range(1,9): ws.cell(cur_row,col).fill = fl(bg)
+
+                # Conta com indentação
+                lv = code.count('.') if code else 6
+                indent = '  ' * min(lv, 5)
+                label  = f"{indent}{code}  {b}" if code else f"          {b}"
+                ws.cell(cur_row,3,label).font = ft(bold,sz,fg)
+                ws.cell(cur_row,3).alignment = al('left')
+
+                # Valor original — azul
+                if val is not None:
+                    dc = ws.cell(cur_row,4,val)
+                    dc.font = ft(bold, sz, '0000FF' if not bold else fg)
+                    dc.fill = fl(ORIG if not bold else bg)
+                    dc.alignment = al('right')
+                    dc.number_format = '#,##0;(#,##0);"-"'
+
+                # Ajuste — roxo fórmula
+                if code in AJUSTES_CODIGOS and val is not None and ajustes[{
+                    'capex':0,'irpj':1,'csll':1,'amort':2
+                }[AJUSTES_CODIGOS[code][0]]]:
+                    ec = ws.cell(cur_row,5,f'=-D{cur_row}')
+                    ec.font = ft(bold,sz,ADJ_FG); ec.fill = fl(ADJ)
+                    ec.alignment = al('right'); ec.number_format = '+#,##0;(#,##0);"-"'
+                    ws.cell(cur_row,8,AJUSTES_CODIGOS[code][1]).font = ft(False,8,ADJ_FG,True)
+                    ws.cell(cur_row,8).alignment = al('left',wrap=True)
+                    ws.cell(cur_row,8).fill = fl(ADJ)
+                else:
+                    ws.cell(cur_row,5,'—').font = ft(False,8,'CCCCCC')
+                    ws.cell(cur_row,5).alignment = al('center')
+
+                # Corrigido — verde fórmula
+                if val is not None:
+                    formula = f'=D{cur_row}+E{cur_row}' if code in AJUSTES_CODIGOS and ajustes[{
+                        'capex':0,'irpj':1,'csll':1,'amort':2
+                    }.get(AJUSTES_CODIGOS.get(code,('x',))[0],99)] else f'=D{cur_row}'
+                    fc = ws.cell(cur_row,6,formula)
+                    fc.font = ft(bold,sz,CORR_FG if not bold else fg)
+                    fc.fill = fl(CORR if not bold else bg)
+                    fc.alignment = al('right')
+                    fc.number_format = '#,##0;(#,##0);"-"'
+
+                # % Rec Bruta
+                if code and bold and val is not None and RB_ROW:
+                    pc = ws.cell(cur_row,7,f'=IF($D${RB_ROW}<>0,D{cur_row}/$D${RB_ROW},0)')
+                    pc.font = ft(bold,sz,'555555'); pc.fill = fl(bg)
+                    pc.alignment = al('right'); pc.number_format = '0.0%;(0.0%);"-"'
+
+                if bold:
+                    for col in range(1,9): ws.cell(cur_row,col).border = bdr(code in H1)
+
+                if code: ROW_MAP[code] = cur_row
+                if code == '01.01.01': RB_ROW = cur_row
+                if code == '05':       RES_ROW = cur_row
+                cur_row += 1
+
+            # Bloco ajustes adicionais
+            ws.row_dimensions[cur_row].height = 8; cur_row += 1
+            ws.merge_cells(f'A{cur_row}:H{cur_row}')
+            c = ws.cell(cur_row,1,'  ▼  AJUSTES ADICIONAIS  ▼')
+            c.font = ft(True,9,WHITE); c.fill = fl(MED); c.alignment = al('center')
+            ws.row_dimensions[cur_row].height = 16; cur_row += 1
+
+            # D&A
+            DA_ROW = cur_row; ws.row_dimensions[cur_row].height = 20
+            for col in range(1,9): ws.cell(cur_row,col).fill = fl(ADJ)
+            ws.cell(cur_row,3,'(+) D&A — Depreciação e Amortização add-back (Ajuste 4)').font = ft(True,10,ADJ_FG)
+            ws.cell(cur_row,3).alignment = al('left')
+            ws.cell(cur_row,4,'—').font = ft(False,9,'CCCCCC'); ws.cell(cur_row,4).alignment = al('center')
+            if RB_ROW and ajustes[3]:
+                da_f = ws.cell(cur_row,5,f'=D{RB_ROW}*{DA_REF}')
+            else:
+                da_f = ws.cell(cur_row,5,0)
+            da_f.font=ft(True,10,ADJ_FG); da_f.fill=fl(ADJ)
+            da_f.alignment=al('right'); da_f.number_format='+#,##0;(#,##0);"-"'
+            da_fc = ws.cell(cur_row,6,f'=E{cur_row}')
+            da_fc.font=ft(True,10,ADJ_FG); da_fc.fill=fl(ADJ)
+            da_fc.alignment=al('right'); da_fc.number_format='#,##0;(#,##0);"-"'
+            ws.cell(cur_row,8,'Aj.4: D&A = Rec Bruta × % da célula D7. Altere lá para calibrar.').font=ft(False,8,ADJ_FG,True)
+            ws.cell(cur_row,8).alignment=al('left',wrap=True); ws.cell(cur_row,8).fill=fl(ADJ)
+            for col in range(1,9): ws.cell(cur_row,col).border = bdr()
+            cur_row += 1
+
+            # Provisão IRPJ+CSLL
+            PROV_ROW = cur_row; ws.row_dimensions[cur_row].height = 20
+            for col in range(1,9): ws.cell(cur_row,col).fill = fl(ADJ)
+            ws.cell(cur_row,3,'(-) Provisão IRPJ+CSLL — reposicionada (lugar correto)').font=ft(True,10,ADJ_FG)
+            ws.cell(cur_row,3).alignment = al('left')
+            ws.cell(cur_row,4,'—').font=ft(False,9,'CCCCCC'); ws.cell(cur_row,4).alignment=al('center')
+            ir = ROW_MAP.get('01.01.02.01.06'); cs = ROW_MAP.get('01.01.02.01.05')
+            if ir and ajustes[1]:
+                pf = ws.cell(cur_row,5,f'=D{ir}' + (f'+D{cs}' if cs else ''))
+            else:
+                pf = ws.cell(cur_row,5,0)
+            pf.font=ft(True,10,ADJ_FG); pf.fill=fl(ADJ); pf.alignment=al('right')
+            pf.number_format='#,##0;(#,##0);"-"'
+            pfc=ws.cell(cur_row,6,f'=E{cur_row}')
+            pfc.font=ft(True,10,ADJ_FG); pfc.fill=fl(ADJ); pfc.alignment=al('right')
+            pfc.number_format='#,##0;(#,##0);"-"'
+            ws.cell(cur_row,8,'Aj.2: IRPJ+CSLL saem das deduções de receita e ficam aqui como provisão.').font=ft(False,8,ADJ_FG,True)
+            ws.cell(cur_row,8).alignment=al('left',wrap=True); ws.cell(cur_row,8).fill=fl(ADJ)
+            for col in range(1,9): ws.cell(cur_row,col).border=bdr()
+            cur_row += 1; ws.row_dimensions[cur_row].height=8; cur_row+=1
+
+            # RESULTADO CORRIGIDO
+            RES_CORR = cur_row; ws.row_dimensions[cur_row].height=28
+            for col in range(1,9): ws.cell(cur_row,col).fill=fl(DARK)
+            ws.cell(cur_row,3,'★  RESULTADO OPERACIONAL CORRIGIDO').font=ft(True,13,WHITE)
+            ws.cell(cur_row,3).alignment=al('left')
+            if RES_ROW:
+                ws.cell(cur_row,4,f'=D{RES_ROW}').font=ft(True,12,ORIG_FG)
+                ws.cell(cur_row,4).fill=fl(ORIG); ws.cell(cur_row,4).alignment=al('right')
+                ws.cell(cur_row,4).number_format='#,##0;(#,##0);"-"'
+            aj_c = [f'E{ROW_MAP[k]}' for k in AJUSTES_CODIGOS if k in ROW_MAP]
+            aj_c += [f'E{DA_ROW}',f'E{PROV_ROW}']
+            aj_s = '+'.join(aj_c) if aj_c else '0'
+            ws.cell(cur_row,5,f'={aj_s}').font=ft(True,12,ADJ_FG)
+            ws.cell(cur_row,5).fill=fl(ADJ); ws.cell(cur_row,5).alignment=al('right')
+            ws.cell(cur_row,5).number_format='+#,##0;(#,##0);"-"'
+            if RES_ROW:
+                ws.cell(cur_row,6,f'=D{RES_ROW}+{aj_s}').font=ft(True,14,CORR_FG)
+            ws.cell(cur_row,6).fill=fl(CORR); ws.cell(cur_row,6).alignment=al('right')
+            ws.cell(cur_row,6).number_format='#,##0;(#,##0);"-"'
+            for col in range(1,9): ws.cell(cur_row,col).border=bdr(True)
+            cur_row+=1
+
+            # EBITDA
+            EBIT_ROW=cur_row; ws.row_dimensions[cur_row].height=24
+            for col in range(1,9): ws.cell(cur_row,col).fill=fl('004D40')
+            ws.cell(cur_row,3,'★  EBITDA Corrigido  (Resultado + Juros Reais + D&A)').font=ft(True,12,WHITE)
+            ws.cell(cur_row,3).alignment=al('left')
+            juros_r=ROW_MAP.get('03.03.01.03'); fin_r=ROW_MAP.get('03.03')
+            if fin_r and RES_ROW:
+                ws.cell(cur_row,4,f'=D{RES_ROW}-D{fin_r}').font=ft(True,11,'9E9E9E')
+                ws.cell(cur_row,4).fill=fl('004D40'); ws.cell(cur_row,4).alignment=al('right')
+                ws.cell(cur_row,4).number_format='#,##0;(#,##0);"-"'
+            if juros_r:
+                ws.cell(cur_row,6,f'=F{RES_CORR}-D{juros_r}+E{DA_ROW}')
+            else:
+                ws.cell(cur_row,6,f'=F{RES_CORR}+E{DA_ROW}')
+            ws.cell(cur_row,6).font=ft(True,14,CORR_FG)
+            ws.cell(cur_row,6).fill=fl(CORR); ws.cell(cur_row,6).alignment=al('right')
+            ws.cell(cur_row,6).number_format='#,##0;(#,##0);"-"'
+            for col in range(1,9): ws.cell(cur_row,col).border=bdr(True)
+            cur_row+=1
+
+            # Margens
+            for lbl,dr,fr in [(f'  Margem EBITDA (% Rec Bruta)',EBIT_ROW,EBIT_ROW),
+                               (f'  Margem Resultado Corrigido (%)',RES_ROW,RES_CORR)]:
+                ws.row_dimensions[cur_row].height=18
+                for col in range(1,9): ws.cell(cur_row,col).fill=fl(CORR)
+                ws.cell(cur_row,3,lbl).font=ft(False,10,CORR_FG); ws.cell(cur_row,3).alignment=al('left')
+                if RB_ROW:
+                    ws.cell(cur_row,4,f'=IF($D${RB_ROW}<>0,D{dr}/$D${RB_ROW},0)').font=ft(True,10,ORIG_FG)
+                    ws.cell(cur_row,4).fill=fl(CORR); ws.cell(cur_row,4).alignment=al('right')
+                    ws.cell(cur_row,4).number_format='0.0%;(0.0%);"-"'
+                    ws.cell(cur_row,6,f'=IF($D${RB_ROW}<>0,F{fr}/$D${RB_ROW},0)').font=ft(True,11,CORR_FG)
+                    ws.cell(cur_row,6).fill=fl(CORR); ws.cell(cur_row,6).alignment=al('right')
+                    ws.cell(cur_row,6).number_format='0.0%;(0.0%);"-"'
+                ws.cell(cur_row,5,'—').font=ft(False,9,'CCCCCC'); ws.cell(cur_row,5).alignment=al('center')
+                ws.cell(cur_row,5).fill=fl(CORR)
+                for col in range(1,9): ws.cell(cur_row,col).border=bdr()
+                cur_row+=1
+
+        # ── OBRAS E CONSOLIDADAS: painel resumido ──
+        elif tipo in ('obras', 'consolidada'):
+            tab_name = ('Obras' if tipo=='obras' else 'Consolidada')[:28]
+            if first_sheet:
+                ws = wb.active; ws.title = tab_name; first_sheet = False
+            else:
+                try: ws = wb.create_sheet(tab_name)
+                except: ws = wb.create_sheet(tab_name + '_2')
+
+            ws.column_dimensions['A'].width = 5
+            ws.column_dimensions['B'].width = 35
+            for col in ['C','D','E','F','G','H']:
+                ws.column_dimensions[col].width = 17
+
+            ws.merge_cells('A1:H1'); c=ws['A1']
+            ts = (datetime.now().strftime('%d/%m/%Y %H:%M'))
+            c.value=f'PAINEL DRE CORRIGIDA — CAMPESATTO CONSTRUTORA  ·  Gerado em {ts}'
+            c.font=ft(True,12,WHITE); c.fill=fl(DARK); c.alignment=al('center')
+            ws.row_dimensions[1].height=26
+
+            hdrs=['','OBRA / PERÍODO','FATURAMENTO','RES. ORIGINAL','+CAPEX','+IRPJ/CSLL','+D&A','RES. CORRIGIDO']
+            for ci,h in enumerate(hdrs,1):
+                c=ws.cell(4,ci,h); c.font=ft(True,9,WHITE); c.fill=fl(MED)
+                c.alignment=al('center'); c.border=bdr()
+            ws.row_dimensions[4].height=20
+            ws.row_dimensions[2].height=6; ws.row_dimensions[3].height=6
+
+            row_e=5
+            if tipo=='obras':
+                for obra,od in dados.items():
+                    bg=WHITE if row_e%2==0 else GRAY2
+                    for col in range(1,9): ws.cell(row_e,col).fill=fl(bg)
+                    ws.cell(row_e,2,obra).font=ft(False,9,'333333'); ws.cell(row_e,2).alignment=al('left')
+                    vals=[od['faturamento'],od['resultado_original'],od['aj1'],od['aj2'],od['aj4'],od['resultado_corrigido']]
+                    for ci,v in zip(range(3,9),vals):
+                        c=ws.cell(row_e,ci,v); c.alignment=al('right')
+                        clr='1B5E20' if (ci==8 and v>=0) else 'E65100' if ci in[4,5,6] else '4A148C' if ci==7 else('B71C1C' if v<0 else '333333')
+                        c.font=ft(False,9,clr); c.number_format='#,##0;(#,##0);"-"'
+                    row_e+=1
+            else:
+                for col in range(1,9): ws.cell(row_e,col).fill=fl(LIGHT)
+                ws.cell(row_e,2,dados['arquivo']).font=ft(True,10,DARK); ws.cell(row_e,2).alignment=al('left')
+                for ci,v in zip(range(3,9),[dados['rec_bruta'],dados['resultado_original'],
+                                             dados.get('capex_aj',0),dados.get('impostos_aj',0),
+                                             dados.get('da_val',0),dados['resultado_corrigido']]):
+                    c=ws.cell(row_e,ci,v); c.font=ft(True,10,'1B5E20' if(ci==8 and v>=0) else'333333')
+                    c.alignment=al('right'); c.number_format='#,##0;(#,##0);"-"'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
 
 def main():
     # Header
