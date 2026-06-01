@@ -177,6 +177,112 @@ def pct(v, base):
     return f"{p:+.1f}%".replace(".", ",")
 
 
+
+
+def processar_dre_mensal(wb, nome_arquivo, ajustes, da_pct):
+    """
+    Processa DRE consolidada de UM único mês.
+    Formato: aba 'Planilha1', col A=Código, col B=Conta, col C=valor do mês.
+    Exportada diretamente do Sienge como relatório mensal.
+    """
+    # Tentar encontrar a aba correta
+    aba = None
+    for sname in wb.sheetnames:
+        if sname.lower() in ('planilha1', 'sheet1', 'plan1', 'dre', 'resultado'):
+            aba = sname
+            break
+    if not aba:
+        aba = wb.sheetnames[0]
+
+    ws = wb[aba]
+    rows = list(ws.iter_rows(values_only=True))
+
+    # Detectar período (header)
+    periodo = 'Mês'
+    if rows and rows[0][2]:
+        periodo = str(rows[0][2]).strip()
+
+    # Mapear código → valor (col C, índice 2)
+    km = {}
+    for i, row in enumerate(rows, 1):
+        code = ' '.join(str(row[0]).strip().split()) if row[0] else ''
+        val  = row[2]
+        if code and val is not None:
+            try:
+                km[code] = (i, float(val))
+            except (TypeError, ValueError):
+                pass
+
+    def gv(code):
+        return km.get(code, (None, 0.0))[1]
+
+    # Valores principais
+    rec_bruta  = gv('01.01.01')
+    deducoes   = gv('01.01.02')
+    irpj_ded   = gv('01.01.02.01.06')   # IRPJ nas deduções (ajuste 2)
+    csll_ded   = gv('01.01.02.01.05')   # CSLL nas deduções (ajuste 2, se existir)
+    outras_rec = gv('01.01.03.01.04')   # Outras Receitas (aportes)
+    custos_dir = gv('02.01.01')
+    custos_ind = gv('02.01.02')
+    capex      = gv('02.01.02.05.04')   # Aquisição de Imobilizado (ajuste 1)
+    desp_adm   = gv('03.01')
+    desp_trib  = gv('03.02')
+    desp_fin   = gv('03.03')
+    juros      = gv('03.03.01.03')      # Juros reais
+    amort      = gv('03.03.01.07')      # Amortização de principal (ajuste 3)
+    outras_nop = gv('04')
+    resultado  = gv('05')
+
+    lucro_bruto = (rec_bruta + deducoes) + custos_dir + custos_ind
+
+    # Calcular ajustes
+    da_val     = abs(rec_bruta) * da_pct
+
+    aj1 = -capex                    if ajustes[0] else 0   # reverte CAPEX (negativo → positivo)
+    aj2 = -(irpj_ded + csll_ded)    if ajustes[1] else 0   # reverte IRPJ+CSLL das deduções
+    aj3 = -amort                    if ajustes[2] else 0   # reverte amortização de principal
+    aj4 = da_val                    if ajustes[3] else 0   # D&A estimado
+
+    res_corr    = resultado + aj1 + aj2 + aj3 + aj4
+    ebitda_orig = resultado - desp_fin - outras_nop
+    ebitda_corr = res_corr  - (desp_fin - amort if ajustes[2] else desp_fin) - outras_nop + aj4
+
+    rec_liq_orig = rec_bruta + deducoes
+    rec_liq_corr = rec_bruta + (deducoes + aj2)  # deduções sem IRPJ/CSLL
+
+    return {
+        'tipo': 'mensal',
+        'arquivo': nome_arquivo,
+        'periodo': periodo,
+        'rec_bruta': rec_bruta,
+        'deducoes': deducoes,
+        'rec_liq_orig': rec_liq_orig,
+        'rec_liq_corr': rec_liq_corr,
+        'custos_dir': custos_dir,
+        'custos_ind': custos_ind,
+        'capex': capex,
+        'lucro_bruto': lucro_bruto,
+        'desp_adm': desp_adm,
+        'desp_trib': desp_trib,
+        'desp_fin': desp_fin,
+        'juros': juros,
+        'amort': amort,
+        'outras_nop': outras_nop,
+        'irpj_csll': irpj_ded + csll_ded,
+        'resultado_original': resultado,
+        'capex_aj': aj1,
+        'impostos_aj': aj2,
+        'amort_aj': aj3,
+        'da_val': aj4,
+        'resultado_corrigido': res_corr,
+        'ebitda_original': ebitda_orig,
+        'ebitda_corrigido': ebitda_corr,
+        'margem_ebitda_orig': ebitda_orig / rec_bruta if rec_bruta else 0,
+        'margem_ebitda_corr': ebitda_corr / rec_bruta if rec_bruta else 0,
+        'margem_res_orig': resultado / rec_bruta if rec_bruta else 0,
+        'margem_res_corr': res_corr / rec_bruta if rec_bruta else 0,
+    }
+
 def detectar_tipo_arquivo(nome):
     n = nome.lower()
     if any(k in n for k in ['resultado', 'obras', 'abril', 'janeiro', 'fevereiro',
@@ -566,11 +672,14 @@ def gerar_excel_corrigido(dados_processados, ajustes, da_pct):
                     c.number_format = '#,##0;(#,##0);"-"'
                 row += 1
 
-        elif tipo == 'consolidada':
+        elif tipo in ('consolidada', 'mensal'):
             d = dados
-            ws.cell(row, 2, d['arquivo']).font = ft(True, 10, '1A2744')
+            periodo = d.get('periodo', '')
+            label = f"{d['arquivo']}" + (f" — {periodo}" if periodo and tipo=='mensal' else '')
+            ws.cell(row, 2, label).font = ft(True, 10, '1A2744')
             vals = [d['rec_bruta'], d['resultado_original'],
-                    d['capex_aj'], d['impostos_aj'], d['da_val'], d['resultado_corrigido']]
+                    d.get('capex_aj', 0), d.get('impostos_aj', 0),
+                    d.get('da_val', 0), d['resultado_corrigido']]
             for ci, v in zip(range(3, 9), vals):
                 c = ws.cell(row, ci, v)
                 c.font = ft(True, 10, '1B5E20' if (ci == 8 and v >= 0) else '333333')
@@ -737,13 +846,40 @@ def main():
                             io.BytesIO(f.read()),
                             keep_vba=False, data_only=True
                         )
-                        if tipo == 'obras':
+                        # Detecção robusta pelo CONTEÚDO do arquivo
+                        n_abas = len(wb.sheetnames)
+                        has_planilha1 = any(s.lower() in ('planilha1','sheet1','plan1')
+                                           for s in wb.sheetnames)
+                        ws_test = wb[wb.sheetnames[0]]
+                        max_col_test = ws_test.max_column
+
+                        if n_abas > 3 and not has_planilha1:
+                            # Múltiplas abas com nomes de obras = formato obras
                             res = processar_dre_obras(wb, f.name, ajustes, da_pct)
                             dados_todos.append(('obras', res))
-                        else:
+                        elif max_col_test <= 4 and has_planilha1:
+                            # Aba única com poucas colunas = mensal
+                            res = processar_dre_mensal(wb, f.name, ajustes, da_pct)
+                            if res and res.get('rec_bruta', 0) != 0:
+                                dados_todos.append(('mensal', res))
+                        elif max_col_test > 10:
+                            # Muitas colunas = anual com meses
                             res = processar_dre_consolidada(wb, f.name, ajustes, da_pct)
-                            if res:
+                            if res and res.get('rec_bruta', 0) != 0:
                                 dados_todos.append(('consolidada', res))
+                            else:
+                                res = processar_dre_mensal(wb, f.name, ajustes, da_pct)
+                                if res:
+                                    dados_todos.append(('mensal', res))
+                        else:
+                            # Tentar mensal primeiro, depois consolidada
+                            res = processar_dre_mensal(wb, f.name, ajustes, da_pct)
+                            if res and res.get('rec_bruta', 0) != 0:
+                                dados_todos.append(('mensal', res))
+                            else:
+                                res = processar_dre_consolidada(wb, f.name, ajustes, da_pct)
+                                if res:
+                                    dados_todos.append(('consolidada', res))
                     except Exception as e:
                         st.warning(f"⚠️ Erro ao processar {f.name}: {e}")
 
@@ -783,7 +919,7 @@ def main():
                         total_res_orig += od['resultado_original']
                         total_res_corr += od['resultado_corrigido']
                         total_ebitda_corr += od['ebitda_corrigido']
-                elif tipo == 'consolidada':
+                elif tipo in ('consolidada', 'mensal'):
                     total_fat += d['rec_bruta']
                     total_res_orig += d['resultado_original']
                     total_res_corr += d['resultado_corrigido']
@@ -867,6 +1003,67 @@ def main():
                     yaxis=dict(gridcolor="#F1F5F9", zeroline=True, zerolinecolor="#CBD5E1"),
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+            # Exibir DRE mensal se houver
+            for tipo, d in dados:
+                if tipo == 'mensal':
+                    st.markdown("---")
+                    st.markdown(f"#### DRE Mensal Corrigida — {d['periodo']} · {d['arquivo']}")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.markdown(f"""<div class="kpi-card">
+                            <div class="kpi-label">Receita Bruta</div>
+                            <div class="kpi-value kpi-neu">{fmt_m(d['rec_bruta'])}</div>
+                            <div class="kpi-sub">{d['periodo']}</div>
+                        </div>""", unsafe_allow_html=True)
+                    with col2:
+                        st.markdown(f"""<div class="kpi-card">
+                            <div class="kpi-label">Resultado Original</div>
+                            <div class="kpi-value {'kpi-pos' if d['resultado_original']>=0 else 'kpi-neg'}">{fmt_m(d['resultado_original'])}</div>
+                            <div class="kpi-sub">DRE Sienge</div>
+                        </div>""", unsafe_allow_html=True)
+                    with col3:
+                        st.markdown(f"""<div class="kpi-card">
+                            <div class="kpi-label">Resultado Corrigido</div>
+                            <div class="kpi-value {'kpi-pos' if d['resultado_corrigido']>=0 else 'kpi-neg'}">{fmt_m(d['resultado_corrigido'])}</div>
+                            <div class="kpi-sub">Após 4 ajustes</div>
+                        </div>""", unsafe_allow_html=True)
+
+                    # Tabela resumida
+                    linhas_mensal = [
+                        ("RECEITA BRUTA", d['rec_bruta'], 0, d['rec_bruta'], "total"),
+                        ("(-) Deduções s/ Receita", d['deducoes'], d['impostos_aj'], d['deducoes']+d['impostos_aj'], "normal"),
+                        ("  ↳ Aj.2: IRPJ+CSLL reposicionados", d['irpj_csll'], -d['irpj_csll'], 0, "ajuste") if d['impostos_aj'] else None,
+                        ("RECEITA LÍQUIDA", d['rec_liq_orig'], d['impostos_aj'], d['rec_liq_corr'], "sub"),
+                        ("(-) Custos Diretos", d['custos_dir'], 0, d['custos_dir'], "normal"),
+                        ("(-) Aquisição Imobilizado (CAPEX)", d['capex'], d['capex_aj'], 0, "ajuste") if d['capex_aj'] else None,
+                        ("(-) Custos Indiretos", d['custos_ind'], d['capex_aj'], d['custos_ind']-d['capex_aj'], "normal"),
+                        ("LUCRO BRUTO", d['lucro_bruto'], d['capex_aj']+d['impostos_aj'], d['lucro_bruto']+d['capex_aj']+d['impostos_aj'], "sub"),
+                        ("(-) Desp Administrativas", d['desp_adm'], 0, d['desp_adm'], "normal"),
+                        ("(-) Desp Tributárias", d['desp_trib'], 0, d['desp_trib'], "normal"),
+                        ("(-) Desp Financeiras", d['desp_fin'], d['amort_aj'], d['desp_fin']+d['amort_aj'], "normal"),
+                        ("  ↳ Aj.3: Amortiz. principal retirada", d['amort'], -d['amort'], 0, "ajuste") if d['amort_aj'] else None,
+                        ("  ↳ Aj.4: D&A estimado adicionado", 0, d['da_val'], d['da_val'], "ajuste") if d['da_val'] else None,
+                        ("(-) Outras NOP", d['outras_nop'], 0, d['outras_nop'], "normal"),
+                        ("★ RESULTADO CORRIGIDO", d['resultado_original'], sum([d['capex_aj'],d['impostos_aj'],d['amort_aj'],d['da_val']]), d['resultado_corrigido'], "destaque"),
+                        (f"  Margem ({d['periodo']})", pct(d['resultado_original'],d['rec_bruta']), "→", pct(d['resultado_corrigido'],d['rec_bruta']), "info"),
+                    ]
+                    html = """<table class='dre-table'>
+                    <thead><tr><th>Linha</th><th>Original</th><th>Ajuste</th><th>Corrigido</th></tr></thead><tbody>"""
+                    for linha in linhas_mensal:
+                        if linha is None: continue
+                        nome_, orig_, adj_, corr_, cls_ = linha
+                        if cls_ == "info":
+                            html += f"<tr class='ajuste'><td class='indent'>{nome_}</td><td class='val-orig'>{orig_}</td><td>→</td><td class='val-corr'>{corr_}</td></tr>"
+                            continue
+                        def fv2(v):
+                            if isinstance(v,str): return v
+                            cor = "val-pos" if float(v)>=0 else "val-neg"
+                            return f"<span class='{cor}'>{fmt_brl_k(float(v))}</span>"
+                        rc_ = {"total":"total","sub":"total","destaque":"destaque","ajuste":"ajuste","normal":""}.get(cls_,"")
+                        html += f"<tr class='{rc_}'><td>{nome_}</td><td class='val-orig'>{fv2(orig_)}</td><td class='val-adj'>{fv2(adj_)}</td><td class='val-corr'>{fv2(corr_)}</td></tr>"
+                    html += "</tbody></table>"
+                    st.markdown(html, unsafe_allow_html=True)
 
             # Download
             st.markdown("---")
