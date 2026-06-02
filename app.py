@@ -1112,5 +1112,3 @@ O Sienge é ótimo para controle operacional, mas mistura eventos de resultado c
 
 if __name__ == "__main__":
     main()
-
-                
